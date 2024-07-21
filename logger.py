@@ -17,4 +17,4 @@ handler.setFormatter(colorlog.ColoredFormatter(
 ))
 logger = colorlog.getLogger()
 logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
