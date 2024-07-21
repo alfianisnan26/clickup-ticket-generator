@@ -1,5 +1,6 @@
 certifi==2024.7.4
 charset-normalizer==2.0.12
+colorlog==6.8.2
 idna==3.7
 python-dotenv==0.20.0
 python-slugify==6.1.2
