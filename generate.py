@@ -8,6 +8,8 @@ from slugify import slugify
 
 
 class AsyncJobRunner:
+    gathered_async_task = []
+
     def __init__(self, max_jobs: int = 5):
         self.max_jobs = max_jobs
         self.semaphore = asyncio.Semaphore(max_jobs)
@@ -21,10 +23,42 @@ class AsyncJobRunner:
         results = await asyncio.gather(*tasks)
         return results
 
-    def run_sync(self, jobs: List[Callable], *args, **kwargs):
+    @staticmethod
+    def run_task(coro: Callable, *args, **kwargs):
         loop = asyncio.get_event_loop()
-        results = loop.run_until_complete(self.run_jobs(jobs, *args, **kwargs))
-        return results
+        task = loop.create_task(coro(*args, **kwargs))
+        AsyncJobRunner.gathered_async_task.append(task)
+
+    @staticmethod
+    async def wait():
+        await asyncio.gather(*AsyncJobRunner.gathered_async_task)
+
+
+class Checklist:
+    async def create(self):
+        request = {
+            "name": self.name,
+            "assignee": self.assignee
+        }
+
+        response = requests.post(Ticket.URL_CHECKLIST_CREATE_ITEM.format(checklist_id=self.checklist_id),
+                                 json=request,
+                                 headers={"Authorization": Ticket.API_KEY})
+        if response.status_code != 200:
+            exception = Exception("Failed to create checklist item", response.status_code, response.text)
+            print(exception)
+            raise exception
+
+        print(f"Success push: checklist [{self.name}] of {self.checklist_id}")
+
+    def __init__(self, name=None, assignee=None):
+        self.checklist_id = None
+        self.name = name
+        self.assignee = assignee
+
+    def with_id(self, checklist_id):
+        self.checklist_id = checklist_id
+        return self
 
 
 class Ticket:
@@ -37,6 +71,7 @@ class Ticket:
     URL_CHECKLIST_CREATE_ITEM = "https://api.clickup.com/api/v2/checklist/{checklist_id}/checklist_item"
 
     def __init__(self, template=None, checklists=None, checklist_name="Approval"):
+        self.synced_child = None
         self.parent = None
         self.effort = None
         self.tags = None
@@ -46,15 +81,16 @@ class Ticket:
         self.template = template
         self.checklists = checklists
         self.checklist_name = checklist_name
-
         self.children = []
 
-    def prepare(self, title="Sample Task", description=None, tags=None, effort=None, parent=None):
+    def prepare(self, title="Sample Task", description=None, tags=None, effort=None, parent=None, synced_child=False):
         self.title = title
         self.description = description
         self.tags = tags
         self.effort = effort
         self.parent = parent
+
+        self.synced_child = synced_child
 
         if self.parent:
             self.parent.children.append(self)
@@ -82,8 +118,14 @@ class Ticket:
             request["time_estimate"] = int(float(effort) * 6 * 60 * 60 * 1000)
 
         id = self.__do_create_task(request)
-        print(f"Success push: {id} | {self.title}")
-        await self.__do_create_subtask()
+
+        parent_id = None
+        if self.parent:
+            parent_id = self.parent.id
+
+        print(f"Success push: {id} of {parent_id} | {self.title}")
+
+        AsyncJobRunner.run_task(self.__do_create_subtask)
 
     def __do_create_task(self, request):
         response = requests.post(Ticket.URL_TASK_CREATE.format(list_id=Ticket.LIST_ID),
@@ -91,16 +133,18 @@ class Ticket:
                                  headers={"Authorization": Ticket.API_KEY})
 
         if response.status_code != 200:
-            raise Exception("Failed to create task", response.status_code, response.text)
+            exception = Exception("Failed to create task", response.status_code, response.text)
+            print(exception)
+            raise exception
 
         self.id = response.json()["id"]
 
         if self.checklists:
-            self.__do_create_checklist()
+            AsyncJobRunner.run_task(self.__do_create_checklist)
 
         return self.id  # task_id for parenthesis
 
-    def __do_create_checklist(self):
+    async def __do_create_checklist(self):
         request = {
             "name": self.checklist_name
         }
@@ -110,31 +154,23 @@ class Ticket:
                                  headers={"Authorization": Ticket.API_KEY})
 
         if response.status_code != 200:
-            raise Exception("Failed to create checklist", response.status_code, response.text)
+            exception = Exception("Failed to create checklist", response.status_code, response.text)
+            print(exception)
+            raise exception
 
         checklist_id = response.json()["checklist"]["id"]
 
-        for checklist in self.checklists:
-            self.__do_create_checklist_item(checklist_id, checklist)
+        job_runner = AsyncJobRunner()
+        jobs = [Checklist(*checklist).with_id(checklist_id).create for checklist in self.checklists]
+        await job_runner.run_jobs(jobs)
 
     async def __do_create_subtask(self):
-        job_runner = AsyncJobRunner(max_jobs=5)
-        await job_runner.run_jobs([child.create for child in self.children])
-
-    @staticmethod
-    def __do_create_checklist_item(checklist_id, checklist):
-        (name, assignee) = checklist
-        request = {
-            "name": name,
-            "assignee": assignee
-        }
-
-        response = requests.post(Ticket.URL_CHECKLIST_CREATE_ITEM.format(checklist_id=checklist_id),
-                                 json=request,
-                                 headers={"Authorization": Ticket.API_KEY})
-
-        if response.status_code != 200:
-            raise Exception("Failed to create checklist", response.status_code, response.text)
+        job_runner = AsyncJobRunner()
+        if self.synced_child:
+            for child in self.children:
+                await child.create()
+        else:
+            await job_runner.run_jobs([child.create for child in self.children])
 
 
 CHECKLIST_MENTOR = ("Mentor", None)
@@ -225,7 +261,9 @@ async def generator(f):
                 handler.level_ticket = Ticket(*TICKET_LEVEL_TEMPLATE)
                 handler.level_ticket.prepare(
                     LEVEL_TITLE_TEMPLATE.format(grade=grade[:2], kd=kd),
-                    tags=["level", slugify(grade)])
+                    tags=["level", slugify(grade)],
+                    synced_child=True
+                )
 
                 document.append(handler.level_ticket)
 
@@ -276,8 +314,9 @@ async def generator(f):
 
             print(f"[ {progress:6.2f} % ]", "Created materi ticket\t" + nama_tiket)
 
-    job_runner = AsyncJobRunner(max_jobs=5)
-    await job_runner.run_jobs([doc.create for doc in document])
+    for doc in document:
+        await doc.create()
+
 
 async def main():
     with open(os.getenv("CSV_FILE"), "r") as f:
@@ -287,4 +326,7 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
+
+    AsyncJobRunner.wait()
+
     loop.close()
