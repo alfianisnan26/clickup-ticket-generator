@@ -1,10 +1,30 @@
-# Create Ticket
-# Create Checklist
-# Create Checklist Item
+import asyncio
 import csv
 import os
+from typing import Callable, List
+
 import requests
 from slugify import slugify
+
+
+class AsyncJobRunner:
+    def __init__(self, max_jobs: int = 5):
+        self.max_jobs = max_jobs
+        self.semaphore = asyncio.Semaphore(max_jobs)
+
+    async def _run_job(self, coro: Callable, *args, **kwargs):
+        async with self.semaphore:
+            return await coro(*args, **kwargs)
+
+    async def run_jobs(self, jobs: List[Callable], *args, **kwargs):
+        tasks = [self._run_job(job, *args, **kwargs) for job in jobs]
+        results = await asyncio.gather(*tasks)
+        return results
+
+    def run_sync(self, jobs: List[Callable], *args, **kwargs):
+        loop = asyncio.get_event_loop()
+        results = loop.run_until_complete(self.run_jobs(jobs, *args, **kwargs))
+        return results
 
 
 class Ticket:
@@ -17,31 +37,53 @@ class Ticket:
     URL_CHECKLIST_CREATE_ITEM = "https://api.clickup.com/api/v2/checklist/{checklist_id}/checklist_item"
 
     def __init__(self, template=None, checklists=None, checklist_name="Approval"):
+        self.parent = None
+        self.effort = None
+        self.tags = None
+        self.description = None
+        self.title = None
+
         self.template = template
         self.checklists = checklists
         self.checklist_name = checklist_name
 
-    def create(self, title="Sample Task", description=None, tags=None, effort=None, parent_id=None):
+        self.children = []
+
+    def prepare(self, title="Sample Task", description=None, tags=None, effort=None, parent=None):
+        self.title = title
+        self.description = description
+        self.tags = tags
+        self.effort = effort
+        self.parent = parent
+
+        if self.parent:
+            self.parent.children.append(self)
+
+    async def create(self):
         request = {
-            "name": title,
-            "markdown_description": description or title,
-            "tags": tags,
+            "name": self.title,
+            "markdown_description": self.description or self.title,
+            "tags": self.tags,
             "status": "Open",
             "notify_all": False,
-            "parent": parent_id,
         }
+
+        if self.parent:
+            request["parent"] = self.parent.id
 
         if self.template:
             with open("./templates/" + self.template, "r") as f:
                 template = f.read()
-                request["markdown_description"] = template.format(description=description)
+                request["markdown_description"] = template.format(description=self.description)
 
-        if effort:
-            effort = str(effort).strip()
+        if self.effort:
+            effort = str(self.effort).strip()
             effort = effort.replace(",", ".")
             request["time_estimate"] = int(float(effort) * 6 * 60 * 60 * 1000)
 
-        self.__do_create_task(request)
+        id = self.__do_create_task(request)
+        print(f"Success push: {id} | {self.title}")
+        await self.__do_create_subtask()
 
     def __do_create_task(self, request):
         response = requests.post(Ticket.URL_TASK_CREATE.format(list_id=Ticket.LIST_ID),
@@ -74,6 +116,10 @@ class Ticket:
 
         for checklist in self.checklists:
             self.__do_create_checklist_item(checklist_id, checklist)
+
+    async def __do_create_subtask(self):
+        job_runner = AsyncJobRunner(max_jobs=5)
+        await job_runner.run_jobs([child.create for child in self.children])
 
     @staticmethod
     def __do_create_checklist_item(checklist_id, checklist):
@@ -145,19 +191,21 @@ class GeneratorHandler:
         return False
 
 
-def generator(file):
+async def generator(f):
     reader = csv.DictReader(f)
 
     total_rows = 0
 
-    document = []
+    raw_document = []
     for row in reader:
         total_rows += 1
-        document.append(row)
+        raw_document.append(row)
 
     handler = GeneratorHandler(total_rows)
 
-    for row in document:
+    document = []
+
+    for row in raw_document:
         level = row["Level"]
         kategori = row["Kategori"]
         nama_tiket = row["Nama Tiket"]
@@ -175,15 +223,17 @@ def generator(file):
         if handler.check_level(level):
             if kategori != "Project":
                 handler.level_ticket = Ticket(*TICKET_LEVEL_TEMPLATE)
-                handler.level_ticket.create(
+                handler.level_ticket.prepare(
                     LEVEL_TITLE_TEMPLATE.format(grade=grade[:2], kd=kd),
                     tags=["level", slugify(grade)])
+
+                document.append(handler.level_ticket)
 
                 print(f"[ {progress:6.2f} % ]", "Created level ticket\t" + nama_tiket)
 
         if kategori == "Project":
             project_ticket = Ticket(*TICKET_PROJECT_TEMPLATE)
-            project_ticket.create(
+            project_ticket.prepare(
                 nama_tiket,
                 description=build_description(
                     description=description,
@@ -192,13 +242,15 @@ def generator(file):
                     semester=semester,
                 ),
                 tags=["materi", slugify(kategori), slugify(materi), slugify(grade)],
-                effort=effort,
-                parent_id=handler.level_ticket.id)
+                effort=effort
+            )
+
+            document.append(project_ticket)
 
             print(f"[ {progress:6.2f} % ]", "Created project ticket\t" + nama_tiket)
         else:
             materi_ticket = Ticket(*TICKET_MATERI_TEMPLATE)
-            materi_ticket.create(
+            materi_ticket.prepare(
                 nama_tiket,
                 description=build_description(
                     description=description,
@@ -208,23 +260,31 @@ def generator(file):
                 ),
                 tags=["materi", slugify(kategori), slugify(materi), slugify(grade)],
                 effort=effort,
-                parent_id=handler.level_ticket.id)
+                parent=handler.level_ticket)
 
-            Ticket(*TICKET_COACHING_TEMPLATE).create(
+            Ticket(*TICKET_COACHING_TEMPLATE).prepare(
                 title="[COACHING] #Nomor Urut",
                 tags=["coaching"],
-                parent_id=materi_ticket.id,
+                parent=materi_ticket,
             )
 
-            Ticket(*TICKET_MENTORING_TEMPLATE).create(
+            Ticket(*TICKET_MENTORING_TEMPLATE).prepare(
                 title="[MENTORING] Nama Mentee",
                 tags=["mentoring"],
-                parent_id=materi_ticket.id,
+                parent=materi_ticket,
             )
 
             print(f"[ {progress:6.2f} % ]", "Created materi ticket\t" + nama_tiket)
 
+    job_runner = AsyncJobRunner(max_jobs=5)
+    await job_runner.run_jobs([doc.create for doc in document])
+
+async def main():
+    with open(os.getenv("CSV_FILE"), "r") as f:
+        await generator(f)
+
 
 if __name__ == "__main__":
-    with open(os.getenv("CSV_FILE"), "r") as f:
-        generator(f)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+    loop.close()
